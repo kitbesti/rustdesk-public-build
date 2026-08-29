@@ -1,0 +1,82 @@
+{
+  // ---------------------------------------------------------------------------
+  // Source Control clarity
+  //
+  // Opening this folder used to surface three separate repositories in the SCM
+  // view, which read as "several projects in one window":
+  //
+  //   1. rustdesk            - this project
+  //   2. libs/hbb_common     - a genuine git submodule, legitimately its own repo
+  //   3. .build/.../vcpkg    - an unrelated third-party checkout left behind by a
+  //                            release build, which has no business being listed
+  //
+  // Repository scanning does not consult .gitignore, so (3) showed up even though
+  // .build/ is ignored. Excluding the build/output directories from the scan
+  // leaves exactly two entries: this project and its submodule.
+  // ---------------------------------------------------------------------------
+  "git.repositoryScanMaxDepth": 1,
+  "git.repositoryScanIgnoredFolders": [
+    "node_modules",
+    ".build",
+    "target",
+    "dist",
+    "vcpkg",
+    "build"
+  ],
+  // Never adopt a repository from a parent directory of this folder.
+  "git.openRepositoryInParentFolders": "never",
+
+  // Show only this project in Source Control.
+  //
+  // libs/hbb_common is a real submodule, so VS Code would list it as a second
+  // provider. It is upstream code that is almost never edited here, and a second
+  // top-level entry is what made the view look like several projects at once.
+  // Hiding it loses nothing that matters: when the submodule does move, the
+  // superproject still shows `libs/hbb_common` as a modified gitlink, which is the
+  // change that actually has to be committed. To work inside the submodule, run git
+  // there directly or flip this back to true.
+  "git.detectSubmodules": false,
+  // Belt and braces: even if a scan reaches them, never list repositories under
+  // .build. VS Code matches these against the repository's absolute path.
+  "git.ignoredRepositories": [
+    "/home/administrator/Downloads/rustdesk/.build/linux/cache/amd64/vcpkg",
+    "/home/administrator/Downloads/rustdesk/.build/linux/environment-pkg/cache-amd64/vcpkg"
+  ],
+  // Group untracked files instead of mixing them in with real edits.
+  "git.untrackedChanges": "separate",
+
+  // ---------------------------------------------------------------------------
+  // Explorer / search noise
+  //
+  // Build trees here are enormous (the vcpkg checkout and target/ alone are tens of
+  // thousands of files). Hiding them keeps the file tree, search results and the
+  // file watcher focused on actual source. Nothing is deleted - untick these
+  // settings to see the directories again.
+  // ---------------------------------------------------------------------------
+  "files.exclude": {
+    ".build": true,
+    "**/.build": true,
+    "target": true,
+    "**/target": true,
+    "flutter/build": true,
+    "flutter/.dart_tool": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/.build": true,
+    "**/dist": true,
+    "flutter/build": true,
+    "flutter/.dart_tool": true,
+    "**/Cargo.lock": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.build/**": true,
+    "**/dist/**": true,
+    "flutter/build/**": true,
+    "flutter/.dart_tool/**": true
+  },
+
+  "rust-analyzer.check.command": "check",
+  "rust-analyzer.cargo.features": ["hwcodec"]
+}

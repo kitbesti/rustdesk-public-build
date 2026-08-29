@@ -1,0 +1,1121 @@
+name: Public Free Multi-Platform Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_local_bridge:
+        description: Use pre-generated bridge files committed in the public build repo
+        required: true
+        type: boolean
+        default: true
+      windows_amd64:
+        description: Build Windows amd64
+        required: true
+        type: boolean
+        default: true
+      macos_amd64:
+        description: Build macOS amd64
+        required: true
+        type: boolean
+        default: true
+      macos_arm64:
+        description: Build macOS arm64
+        required: true
+        type: boolean
+        default: true
+      linux_amd64:
+        description: Build Linux amd64 .deb
+        required: true
+        type: boolean
+        default: true
+      linux_arm64:
+        description: Build Linux arm64 .deb
+        required: true
+        type: boolean
+        default: true
+      android_arm64:
+        description: Build Android arm64 APK
+        required: true
+        type: boolean
+        default: true
+      ios_unsigned:
+        description: Build unsigned iOS xcarchive
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  SCITER_RUST_VERSION: "1.75"
+  RUST_VERSION: "1.75"
+  MAC_RUST_VERSION: "1.81"
+  CARGO_NDK_VERSION: "3.1.2"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  NDK_VERSION: "r28c"
+
+jobs:
+  generate-bridge:
+    if: ${{ inputs.windows_amd64 || inputs.macos_amd64 || inputs.macos_arm64 || inputs.linux_amd64 || inputs.linux_arm64 || inputs.android_arm64 || inputs.ios_unsigned }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Verify vendored hbb_common exists
+        shell: bash
+        run: |
+          test -f libs/hbb_common/Cargo.toml
+
+      - name: Verify pre-generated bridge files
+        if: ${{ inputs.use_local_bridge }}
+        shell: bash
+        run: |
+          for path in \
+            src/bridge_generated.rs \
+            src/bridge_generated.io.rs \
+            flutter/lib/generated_bridge.dart \
+            flutter/lib/generated_bridge.freezed.dart \
+            flutter/macos/Runner/bridge_generated.h \
+            flutter/ios/Runner/bridge_generated.h; do
+            test -f "$path"
+          done
+
+      - name: Install prerequisites
+        if: ${{ !inputs.use_local_bridge }}
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc \
+            g++ \
+            git \
+            libclang-dev \
+            libgtk-3-dev \
+            llvm-dev \
+            nasm \
+            ninja-build \
+            pkg-config \
+            wget
+
+      - name: Install Rust toolchain
+        if: ${{ !inputs.use_local_bridge }}
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Restore Rust cache
+        if: ${{ !inputs.use_local_bridge }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: public-bridge-ubuntu
+
+      - name: Install Flutter for bridge generation
+        if: ${{ !inputs.use_local_bridge }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Generate bridge files
+        if: ${{ !inputs.use_local_bridge }}
+        shell: bash
+        run: |
+          cargo install cargo-expand --version "${CARGO_EXPAND_VERSION}" --locked
+          cargo install flutter_rust_bridge_codegen --version "${FLUTTER_RUST_BRIDGE_VERSION}" --features uuid --locked
+          pushd flutter >/dev/null
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' pubspec.yaml
+          flutter pub get
+          popd >/dev/null
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          retention-days: 1
+          compression-level: 0
+          path: |
+            src/bridge_generated.rs
+            src/bridge_generated.io.rs
+            flutter/lib/generated_bridge.dart
+            flutter/lib/generated_bridge.freezed.dart
+            flutter/macos/Runner/bridge_generated.h
+            flutter/ios/Runner/bridge_generated.h
+
+  build-windows-amd64:
+    if: ${{ inputs.windows_amd64 }}
+    needs: [generate-bridge]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Replace engine with RustDesk custom Flutter engine
+        shell: pwsh
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          # Derive the SDK location from FLUTTER_ROOT rather than rebuilding the
+          # hostedtoolcache path by hand. subosito/flutter-action now nests the SDK one
+          # level deeper (.../stable-<ver>-x64/flutter), so the hand-built path pointed at
+          # a directory that does not exist and Move-Item failed with "Could not find a
+          # part of the path". FLUTTER_ROOT is exported by the action and stays correct
+          # whatever layout it uses.
+          $engineDir = Join-Path $env:FLUTTER_ROOT 'bin/cache/artifacts/engine/windows-x64-release'
+          New-Item -ItemType Directory -Force -Path $engineDir | Out-Null
+          Move-Item -Force windows-x64-release\* $engineDir
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          [[ "3.24.5" == "${FLUTTER_VERSION}" ]] && git apply "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: public-windows-2022
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          if ! "$VCPKG_ROOT"/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log_file; do
+              echo "${log_file}:"
+              echo "======"
+              cat "${log_file}"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-x64-windows-static-rel-out.log" || true
+
+      - name: Build RustDesk
+        shell: pwsh
+        run: |
+          python .\build.py --hwcodec --flutter --vram --skip-portable-pack
+          if (Test-Path .\rustdesk) {
+            Remove-Item -Recurse -Force .\rustdesk
+          }
+          Move-Item .\flutter\build\windows\x64\runner\Release .\rustdesk
+          Compress-Archive -Path .\rustdesk\* -DestinationPath ".\rustdesk-$env:VERSION-windows-amd64.zip"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-windows-amd64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}-windows-amd64.zip
+
+  build-macos-amd64:
+    if: ${{ inputs.macos_amd64 }}
+    needs: [generate-bridge]
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      RUST_TARGET: x86_64-apple-darwin
+      VCPKG_TRIPLET: x64-osx
+      EXTRA_BUILD_ARGS: ""
+      DMG_ARCH: x86_64
+      MACOS_CACHE_PREFIX: public-amd64-macos-15-intel
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install build runtime
+        shell: bash
+        run: |
+          brew install llvm create-dmg
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+
+      - name: Install NASM 2.16.x
+        shell: bash
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip -q nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          [[ "3.24.5" == "${FLUTTER_VERSION}" ]] && git apply "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+      - name: Work around Flutter scheduler issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ env.RUST_TARGET }}
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ env.MACOS_CACHE_PREFIX }}
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          if ! "$VCPKG_ROOT"/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log_file; do
+              echo "${log_file}:"
+              echo "======"
+              cat "${log_file}"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${VCPKG_TRIPLET}-rel-out.log" || true
+
+      - name: Build RustDesk
+        shell: bash
+        run: |
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${EXTRA_BUILD_ARGS}
+
+      - name: Re-sign app bundle
+        shell: bash
+        run: |
+          APP=./flutter/build/macos/Build/Products/Release/RustDesk.app
+          # build.py copies target/release/service into Contents/MacOS/ *after* Xcode has
+          # ad-hoc signed the bundle, which breaks the signature seal:
+          #   codesign --verify -> "a sealed resource is missing or invalid"
+          #                        "file added: .../Contents/MacOS/service"
+          # On macOS 15+ a broken seal stops the app launching at all - it silently fails
+          # to open with no visible error. Upstream never sees this because their release
+          # path re-signs with a Developer ID afterwards; an unsigned public build has no
+          # such step, so re-seal ad-hoc here, before the DMG is built around it.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Create unsigned DMG
+        shell: bash
+        run: |
+          CREATE_DMG="$(command -v create-dmg)"
+          perl -0pi -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 "rustdesk-${VERSION}-${DMG_ARCH}.dmg" ./flutter/build/macos/Build/Products/Release/RustDesk.app
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-macos-amd64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}-${{ env.DMG_ARCH }}.dmg
+
+  build-macos-arm64:
+    if: ${{ inputs.macos_arm64 }}
+    needs: [generate-bridge]
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      RUST_TARGET: aarch64-apple-darwin
+      VCPKG_TRIPLET: arm64-osx
+      EXTRA_BUILD_ARGS: --screencapturekit
+      DMG_ARCH: aarch64
+      MACOS_CACHE_PREFIX: public-arm64-macos-14
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install build runtime
+        shell: bash
+        run: |
+          brew install llvm create-dmg
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+
+      - name: Install NASM 2.16.x
+        shell: bash
+        run: |
+          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
+          unzip -q nasm-2.16.03-macosx.zip
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          nasm --version
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          [[ "3.24.5" == "${FLUTTER_VERSION}" ]] && git apply "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+      - name: Work around Flutter scheduler issue
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: ${{ env.RUST_TARGET }}
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ env.MACOS_CACHE_PREFIX }}
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          if ! "$VCPKG_ROOT"/vcpkg install --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log_file; do
+              echo "${log_file}:"
+              echo "======"
+              cat "${log_file}"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${VCPKG_TRIPLET}-rel-out.log" || true
+
+      - name: Build RustDesk
+        shell: bash
+        run: |
+          if [ "${RUST_TARGET}" = "aarch64-apple-darwin" ]; then
+            MIN_MACOS_VERSION="12.3"
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+          fi
+          ./build.py --flutter --hwcodec --unix-file-copy-paste ${EXTRA_BUILD_ARGS}
+
+      - name: Re-sign app bundle
+        shell: bash
+        run: |
+          APP=./flutter/build/macos/Build/Products/Release/RustDesk.app
+          # build.py copies target/release/service into Contents/MacOS/ *after* Xcode has
+          # ad-hoc signed the bundle, which breaks the signature seal:
+          #   codesign --verify -> "a sealed resource is missing or invalid"
+          #                        "file added: .../Contents/MacOS/service"
+          # On macOS 15+ a broken seal stops the app launching at all - it silently fails
+          # to open with no visible error. Upstream never sees this because their release
+          # path re-signs with a Developer ID afterwards; an unsigned public build has no
+          # such step, so re-seal ad-hoc here, before the DMG is built around it.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Create unsigned DMG
+        shell: bash
+        run: |
+          CREATE_DMG="$(command -v create-dmg)"
+          perl -0pi -e 's/MAXIMUM_UNMOUNTING_ATTEMPTS=3/MAXIMUM_UNMOUNTING_ATTEMPTS=7/' "$CREATE_DMG"
+          create-dmg --icon "RustDesk.app" 200 190 --hide-extension "RustDesk.app" --window-size 800 400 --app-drop-link 600 185 "rustdesk-${VERSION}-${DMG_ARCH}.dmg" ./flutter/build/macos/Build/Products/Release/RustDesk.app
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-macos-arm64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}-${{ env.DMG_ARCH }}.dmg
+
+  build-android-arm64:
+    if: ${{ inputs.android_arm64 }}
+    needs: [generate-bridge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc-multilib \
+            git \
+            g++ \
+            g++-multilib \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            libc6-dev \
+            libclang-dev \
+            libunwind-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev \
+            libpulse-dev \
+            libva-dev \
+            libxcb-damage0-dev \
+            libxcb-randr0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxdo-dev \
+            libxfixes-dev \
+            llvm-dev \
+            nasm \
+            ninja-build \
+            openjdk-17-jdk-headless \
+            pkg-config \
+            wget
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          [[ "3.24.5" == "${ANDROID_FLUTTER_VERSION}" ]] && git apply "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install Android vcpkg dependencies
+        shell: bash
+        run: |
+          if ! ./flutter/build_android_deps.sh arm64-v8a; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log_file; do
+              echo "${log_file}:"
+              echo "======"
+              cat "${log_file}"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: public-android-arm64
+          key: aarch64-linux-android
+
+      - name: Build RustDesk Android library
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
+          ./flutter/ndk_arm64.sh
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+
+      - name: Build Android APK
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        run: |
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          pushd flutter >/dev/null
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk "../rustdesk-${VERSION}-android-arm64.apk"
+          popd >/dev/null
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-android-arm64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}-android-arm64.apk
+
+  build-ios-unsigned:
+    if: ${{ inputs.ios_unsigned }}
+    needs: [generate-bridge]
+    runs-on: macos-14
+    timeout-minutes: 75
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          brew install nasm yasm
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          [[ "3.24.5" == "${FLUTTER_VERSION}" ]] && git apply "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          if ! "$VCPKG_ROOT"/vcpkg \
+            install \
+            --triplet arm64-ios \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r log_file; do
+              echo "${log_file}:"
+              echo "======"
+              cat "${log_file}"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-arm64-ios-rel-out.log" || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-ios
+          components: rustfmt
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: public-ios
+          key: aarch64-apple-ios
+
+      - name: Build RustDesk iOS library
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo build --features flutter,hwcodec --release --target aarch64-apple-ios --lib
+
+      - name: Build unsigned iOS archive
+        shell: bash
+        run: |
+          pushd flutter >/dev/null
+          flutter build ipa --release --no-codesign
+          test -d build/ios/archive/Runner.xcarchive
+          popd >/dev/null
+
+      - name: Upload unsigned iOS archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-ios-xcarchive
+          retention-days: 3
+          compression-level: 0
+          path: flutter/build/ios/archive/Runner.xcarchive
+
+  # Linux desktop .deb packages.
+  #
+  # Mirrors upstream flutter-build.yml's build-rustdesk-linux recipe: the host runner
+  # builds the vcpkg dependencies, then the Rust and Flutter build happens inside an
+  # ubuntu18.04 container via run-on-arch-action so the resulting binaries keep a low
+  # glibc requirement. arm64 uses GitHub's native ubuntu-22.04-arm runner, which is
+  # free for public repositories, so there is no qemu emulation in that path.
+  build-linux-amd64:
+    if: ${{ inputs.linux_amd64 }}
+    needs: [generate-bridge]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm qemu-user-static
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 12
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Save Rust toolchain version
+        run: echo "RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')" >> $GITHUB_ENV
+
+      - name: Disable rust bridge build
+        run: sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        run: |
+          sudo apt-get install -y libva-dev
+          if ! $VCPKG_ROOT/vcpkg install --triplet x64-linux --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" -exec sh -c 'echo "$1:"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+      - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
+        name: Build rustdesk
+        with:
+          arch: x86_64
+          distro: ubuntu18.04
+          githubToken: ${{ github.token }}
+          setup: |
+            ls -l "${PWD}"
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            apt-get install -y build-essential clang cmake curl gcc git g++ \
+              libayatana-appindicator3-dev libasound2-dev libclang-10-dev \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgtk-3-dev \
+              libpulse-dev libva-dev libxcb-damage0-dev libxcb-randr0-dev \
+              libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev \
+              llvm-10-dev nasm ninja-build pkg-config tree python3 unzip wget \
+              xz-utils libssl-dev
+            apt-get remove -y libopus-dev || true
+          run: |
+            git config --global --add safe.directory "*"
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+            tar -zxf rust.tar.gz > /dev/null && rm rust.tar.gz
+            cd rust-${{ env.RUST_TOOLCHAIN_VERSION }}-x86_64-unknown-linux-gnu && ./install.sh
+            cd .. && rm -rf rust-${{ env.RUST_TOOLCHAIN_VERSION }}-x86_64-unknown-linux-gnu
+            popd
+
+            pushd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            cargo build --locked --lib --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build
+            popd
+
+            pushd /opt
+            wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            export PATH=/opt/flutter/bin:$PATH
+            flutter doctor -v
+            popd
+
+            if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+              pushd /opt/flutter
+              git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+              popd
+            fi
+
+            pushd /workspace
+            export PATH=/opt/flutter/bin:$PATH
+            export CARGO_INCREMENTAL=0
+            export DEB_ARCH=amd64
+            python3 ./build.py --flutter --skip-cargo
+            popd
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-linux-amd64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}*.deb
+
+  build-linux-arm64:
+    if: ${{ inputs.linux_arm64 }}
+    needs: [generate-bridge]
+    # Native arm64 runner, free for public repositories - no qemu emulation.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 150
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/lib/android /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          echo "VERSION=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-unknown-linux-gnu
+          components: rustfmt
+
+      - name: Save Rust toolchain version
+        run: echo "RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')" >> $GITHUB_ENV
+
+      - name: Disable rust bridge build
+        run: sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        # On arm64 vcpkg picks the runner's own cmake, which is too old for this
+        # baseline's spdx script (string(JSON STRING_ENCODE)); make it fetch the one it
+        # pins instead, as it already does on x64.
+        env:
+          VCPKG_FORCE_DOWNLOADED_BINARIES: "1"
+        run: |
+          sudo apt-get install -y libva-dev
+          if ! $VCPKG_ROOT/vcpkg install --triplet arm64-linux --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" -exec sh -c 'echo "$1:"; cat "$1"' _ {} \;
+            exit 1
+          fi
+
+      - uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8 # no release tag; commit 2026-05-26
+        name: Build rustdesk
+        with:
+          arch: aarch64
+          distro: ubuntu18.04
+          githubToken: ${{ github.token }}
+          setup: |
+            ls -l "${PWD}"
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            apt-get install -y build-essential clang cmake curl gcc git g++ \
+              libayatana-appindicator3-dev libasound2-dev libclang-10-dev \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgtk-3-dev \
+              libpulse-dev libva-dev libxcb-damage0-dev libxcb-randr0-dev \
+              libxcb-shape0-dev libxcb-xfixes0-dev libxdo-dev libxfixes-dev \
+              llvm-10-dev nasm ninja-build pkg-config tree python3 unzip wget \
+              xz-utils libssl-dev
+            apt-get remove -y libopus-dev || true
+          run: |
+            git config --global --add safe.directory "*"
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-aarch64-unknown-linux-gnu.tar.gz
+            tar -zxf rust.tar.gz > /dev/null && rm rust.tar.gz
+            cd rust-${{ env.RUST_TOOLCHAIN_VERSION }}-aarch64-unknown-linux-gnu && ./install.sh
+            cd .. && rm -rf rust-${{ env.RUST_TOOLCHAIN_VERSION }}-aarch64-unknown-linux-gnu
+            popd
+
+            pushd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            cargo build --locked --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build
+            popd
+
+            # Upstream's Flutter does not ship a linux-arm64 desktop engine, so the arm64
+            # package is built with sony/flutter-elinux, seeded with the shader_lib from
+            # the x64 engine. build.py is redirected to it and to the arm64 output path.
+            pushd /workspace
+            sed -i "s/flutter build linux --release/flutter-elinux build linux --verbose/g" ./build.py
+            sed -i "s|x64/release|arm64/release|g" ./build.py
+            popd
+
+            pushd /opt
+            wget -q https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            git clone https://github.com/sony/flutter-elinux.git || true
+            pushd flutter-elinux
+              git fetch
+              git reset --hard ${{ env.FLUTTER_VERSION }}
+              bin/flutter-elinux doctor -v
+              bin/flutter-elinux precache --linux
+            popd
+            cp -R flutter/bin/cache/artifacts/engine/linux-x64/shader_lib flutter-elinux/flutter/bin/cache/artifacts/engine/linux-arm64
+            rm -rf flutter
+            popd
+
+            if [[ "3.24.5" == "${{ env.FLUTTER_VERSION }}" ]]; then
+              pushd /opt/flutter-elinux/flutter
+              git apply /workspace/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+              popd
+            fi
+
+            pushd /workspace
+            export PATH=/opt/flutter-elinux/bin:$PATH
+            export CARGO_INCREMENTAL=0
+            export DEB_ARCH=arm64
+            python3 ./build.py --flutter --skip-cargo
+            popd
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-linux-arm64
+          retention-days: 3
+          compression-level: 0
+          path: rustdesk-${{ env.VERSION }}*.deb
